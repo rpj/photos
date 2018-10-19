@@ -108,7 +108,7 @@ class BaseImageSink(object):
 
 # basic class that just prints a json-ish array to stdout
 class ProcImageSink(BaseImageSink):
-    def preprocess(self):
+    def preprocess(self, num):
         print("[")
 
     def postprocess(self):
@@ -138,12 +138,15 @@ class SQLiteSink(BaseImageSink):
             raise BaseException("SQLiteSink needs a path!")
 
         self._path = path
+        self._errcnt = {'insert_image':0,'insert_exif':0,'commit':0,'json_encode':0}
 
     def preprocess(self, num):
         if os.path.exists(self._path):
+            eprint("SQL sink removing existing DB at '{}'".format(self._path))
             os.remove(self._path)
 
         self._conn = sqlite3.connect(self._path)
+        self._conn.text_factory = lambda x: unicode(x, "utf-8", "ignore")
 
         _cur = self._conn.cursor()
 
@@ -152,12 +155,54 @@ class SQLiteSink(BaseImageSink):
 
         self._conn.commit()
 
+    def postprocess(self):
+        eprint("\nSQL sink (to '{}') error report:\n{}\n".format(self._path, json.dumps(self._errcnt)))
+
     def sinkProcessedImage(self, p):
         _c = self._conn.cursor()
         a = (p['width'], p['height'], p['format'], os.path.split(p['path'])[-1], p['hashes']['average_hash'], p['hashes']['phash'], p['hashes']['dhash'])
-        r = _c.execute("insert into image values(NULL, ?, ?, ?, ?, ?, ?, ?)", a)
-        #TODO: insert EXIF!
-        self._conn.commit()
+        iid = -1
+
+        try:
+            iid = _c.execute("insert into image values(NULL, ?, ?, ?, ?, ?, ?, ?)", a).lastrowid
+        except Exception as e:
+            eprint("Failed to insert: '{}'".format(e))
+            eprint("SQL args:\n{}".format(a))
+            self._errcnt['insert_image'] += 1
+
+        if 'exif' in p and iid > 0:
+            e = {k: list(v) if isinstance(v, tuple) else v for k, v in p['exif'].items()}
+            mk = e['Make'] if 'Make' in e else None
+            md = e['Model'] if 'Model' in e else None
+            dt = e['DateTimeDigitized'] if 'DateTimeDigitized' in e else None
+
+            # fixup for images for which each EXIF field is represented as a list
+            # won't modify the values if they are already a scalar type
+            af = map(lambda x: x[0] if isinstance(x, list) else x, [mk, md, dt])
+
+            a = (iid, af[0], af[1], af[2], None)
+            try:
+                e_enc = json.dumps(e).encode('utf-8')
+                a = (iid, af[0], af[1], af[2], e_enc)
+            except Exception as _e:
+                eprint("Failed to encode EXIF as JSON: '{}'".format(_e))
+                eprint("EXIF in question:\n{}".format(e))
+                self._errcnt['json_encode'] += 1
+
+            try:
+                _c.execute("insert into image_exif values(NULL, ?, ?, ?, ?, ?)", a)
+            except Exception as _e:
+                eprint("Failed to insert EXIF: '{}'".format(_e))
+                eprint("JSON'ed EXIF:\n{}".format(a[4]))
+                eprint("SQL args:\n{}".format(a))
+                self._errcnt['insert_exif'] += 1
+
+        if iid > 0:
+            try: 
+                self._conn.commit()
+            except Exception as _e:
+                eprint("Failed to commit SQL transaction: '{}'".format(_e))
+                self._errcnt['commit'] += 1
  
 if __name__ == "__main__":
     ops, args = getopt(sys.argv[1:], "u:s:")
