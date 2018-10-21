@@ -1,16 +1,20 @@
-#!/usr/bin/python -u
+#!/usr/bin/env python
 
 from __future__ import print_function
 import os
+import io
 import sys
+import md5
 import json
+import rawpy
 import sqlite3
 import imagehash as ih
 from PIL import Image, ImageStat, ExifTags, TiffTags
 from getopt import getopt
+from monotonic import time as mtime
 
-# enable 'whash' at your own risk: it can be *incredibly* slow
-H_ALGS = [ih.average_hash, ih.phash, ih.dhash]#, ih.whash]
+H_ALGS = [ih.average_hash, ih.phash, ih.dhash]
+WHASH_ENABLED = False
 
 def eprint(*args, **kwargs):
     print(*args, file=sys.stderr, **kwargs)
@@ -51,7 +55,12 @@ def get_exif(img):
 def get_image_stats(img):
     include = ['rms', 'sum', 'sum2', 'mean']
     stat = ImageStat.Stat(img)
-    return { k: getattr(stat, '_get' + k)() for k in include if '_get' + k in dir(stat) }
+    osstat = os.stat(img.filename)
+    _rv = { k: getattr(stat, '_get' + k)() for k in include if '_get' + k in dir(stat) }
+    _rv['fsize'] = osstat.st_size
+    _rv['fmtime'] = osstat.st_mtime
+    _rv['md5'] = md5.md5(img.filename).hexdigest()
+    return _rv
 
 def process_image_list(il, sinks=None):
     stats = {'formats':{},'modes':{},'pixels':{},'have_exif':0,'processed':0}
@@ -63,6 +72,23 @@ def process_image_list(il, sinks=None):
 
         if 'MakerNote' in ex:
             del ex['MakerNote']
+        if 'PrintImageMatching' in ex:
+            del ex['PrintImageMatching']
+
+        # if the image is an NEF (Nikon Raw), the basic Pillow TIFF parse
+        # will downscale the image dramatically. use rawpy to get an Image
+        # that is the correct represenation of the RAW data
+        # Since we've already gathered the file's EXIF info above, we can
+        # replace the Image instance in place rather than need two copies
+        frmt_override = None
+        if i.format == "TIFF" and os.path.basename(iname).split(".")[-1] == "NEF":
+            try:
+                i = Image.fromarray(rawpy.imread(iname).postprocess())
+                i.filename = iname
+                frmt_override = "NEF"
+            except Exception as _e:
+                eprint("Failed to convert NEF '{}' to RAW for processing: {}".format(iname, _e))
+                eprint("Continuining with downgraded TIFF")
 
         _p = str(i.width * i.height)
         stats['pixels'][_p] = stats['pixels'][_p] + 1 if _p in stats['pixels'] else 1
@@ -73,15 +99,24 @@ def process_image_list(il, sinks=None):
         if len(ex):
             stats['have_exif'] += 1
 
+        def gen_png_thumb_bytes(img):
+            ic = img.copy()
+            ic.thumbnail((320,320)) # TODO: make config'able!
+            icb = io.BytesIO()
+            ic.save(icb, "PNG")
+            icb.seek(0)
+            return icb.read()
+
         pimg = {
             'path': iname,
             'hashes': hashes_for_image(i),
-            'format': i.format,
+            'format': frmt_override if frmt_override else i.format,
             'mode': i.mode,
             'width': i.width,
             'height': i.height,
             'exif': ex,
-            'stats': get_image_stats(i)
+            'stats': get_image_stats(i),
+            'png_thumb': gen_png_thumb_bytes(i)
         }
 
         map(lambda s: s.sinkProcessedImage(pimg), sinks)
@@ -115,6 +150,8 @@ class ProcImageSink(BaseImageSink):
         print("]")
 
     def sinkProcessedImage(self, pimg):
+        if 'png_thumb' in pimg:
+            pimg['png_thumb'] = len(pimg['png_thumb'])
         print(json.dumps(pimg) + ",")
 
 class StatusSink(BaseImageSink):
@@ -124,12 +161,14 @@ class StatusSink(BaseImageSink):
 
     def preprocess(self, num):
         self._ex = num
+        self._st = mtime.time()
 
     def postprocess(self):
         eprint("Finished processing {} images.".format(self._ex))
 
     def sinkProcessedImage(self, p):
-        eprint("[{:6.2f}%, {:05}/{:05}] {}".format((float(self._count) / self._ex) * 100, self._count, self._ex, p['path']))
+        el = mtime.time() - self._st
+        eprint("[{:6.2f}%, {:05}/{:05}, {:6.3f}m elapsed] {}".format((float(self._count) / self._ex) * 100, self._count, self._ex, (el / 60.0), p['path']))
         self._count += 1
 
 class SQLiteSink(BaseImageSink):
@@ -138,7 +177,7 @@ class SQLiteSink(BaseImageSink):
             raise BaseException("SQLiteSink needs a path!")
 
         self._path = path
-        self._errcnt = {'insert_image':0,'insert_exif':0,'commit':0,'json_encode':0}
+        self._errcnt = {'insert_image':0,'insert_exif':0,'insert_stat':0,'insert_thumb':0,'commit':0,'json_encode':0}
 
     def preprocess(self, num):
         if os.path.exists(self._path):
@@ -151,7 +190,10 @@ class SQLiteSink(BaseImageSink):
         _cur = self._conn.cursor()
 
         _cur.execute("create table image_exif (id integer primary key, img_id integer, make text, model text, digi_time real, bulk_json text)")
-        _cur.execute("create table image (id integer primary key, width integer, height integer, format text, name text, ahash text, phash text, dhash text)")
+        _cur.execute("create table image_stats (id integer primary key, img_id integer, rms text, sum text, sum2 text, mean text, fsize integer, fmtime real, md5 text)")
+        _cur.execute("create table image_thumbs (id integer primary key, img_id integer, png_thumbnail blob)")
+        _cur.execute("create table image (id integer primary key, width integer, height integer, format text, path text, name text, ahash text, phash text, dhash text" 
+                + (", whash text" if WHASH_ENABLED else "") + ")")
 
         self._conn.commit()
 
@@ -160,17 +202,20 @@ class SQLiteSink(BaseImageSink):
 
     def sinkProcessedImage(self, p):
         _c = self._conn.cursor()
-        a = (p['width'], p['height'], p['format'], os.path.split(p['path'])[-1], p['hashes']['average_hash'], p['hashes']['phash'], p['hashes']['dhash'])
+        a = [p['width'], p['height'], p['format'], os.path.split(p['path'])[0], os.path.split(p['path'])[-1], p['hashes']['average_hash'], p['hashes']['phash'], p['hashes']['dhash']]
+        if WHASH_ENABLED:
+            a.append(p['hashes']['whash'])
         iid = -1
 
         try:
-            iid = _c.execute("insert into image values(NULL, ?, ?, ?, ?, ?, ?, ?)", a).lastrowid
+            iid = _c.execute("insert into image values(NULL, ?, ?, ?, ?, ?, ?, ?, ?" 
+                    + (", ?" if WHASH_ENABLED else "") + ")", tuple(a)).lastrowid
         except Exception as e:
             eprint("Failed to insert: '{}'".format(e))
             eprint("SQL args:\n{}".format(a))
             self._errcnt['insert_image'] += 1
 
-        if 'exif' in p and iid > 0:
+        if 'exif' in p and len(p['exif']) and iid > 0:
             e = {k: list(v) if isinstance(v, tuple) else v for k, v in p['exif'].items()}
             mk = e['Make'] if 'Make' in e else None
             md = e['Model'] if 'Model' in e else None
@@ -180,22 +225,38 @@ class SQLiteSink(BaseImageSink):
             # won't modify the values if they are already a scalar type
             af = map(lambda x: x[0] if isinstance(x, list) else x, [mk, md, dt])
 
-            a = (iid, af[0], af[1], af[2], None)
+            a = [iid, af[0], af[1], af[2], None]
             try:
-                e_enc = json.dumps(e).encode('utf-8')
-                a = (iid, af[0], af[1], af[2], e_enc)
+                a[4] = json.dumps(e).encode('utf-8')
             except Exception as _e:
                 eprint("Failed to encode EXIF as JSON: '{}'".format(_e))
                 eprint("EXIF in question:\n{}".format(e))
                 self._errcnt['json_encode'] += 1
 
             try:
-                _c.execute("insert into image_exif values(NULL, ?, ?, ?, ?, ?)", a)
+                _c.execute("insert into image_exif values(NULL, ?, ?, ?, ?, ?)", tuple(a))
             except Exception as _e:
                 eprint("Failed to insert EXIF: '{}'".format(_e))
                 eprint("JSON'ed EXIF:\n{}".format(a[4]))
                 eprint("SQL args:\n{}".format(a))
                 self._errcnt['insert_exif'] += 1
+
+        if 'stats' in p and iid > 0:
+            e = {k: json.dumps(v) if isinstance(v, list) else v for k, v in p['stats'].items()}
+            a = (iid, e['rms'], e['sum'], e['sum'], e['mean'], e['fsize'], e['fmtime'], e['md5'])
+            
+            try:
+                _c.execute("insert into image_stats values(NULL, ?, ?, ?, ?, ?, ?, ?, ?)", a)
+            except Exception as _e:
+                eprint("Failed to insert STATS: '{}'".format(_e))
+                self._errcnt['insert_stat'] += 1
+
+        if 'png_thumb' in p and len(p['png_thumb']) and iid > 0:
+            try:
+                _c.execute("insert into image_thumbs values(NULL, ?, ?)", (iid, p['png_thumb']))
+            except Exception as _e:
+                eprint("Failed to insert PNG THUMB: '{}'".format(_e))
+                self._errcnt['insert_thumb'] += 1
 
         if iid > 0:
             try: 
@@ -205,7 +266,7 @@ class SQLiteSink(BaseImageSink):
                 self._errcnt['commit'] += 1
  
 if __name__ == "__main__":
-    ops, args = getopt(sys.argv[1:], "u:s:")
+    ops, args = getopt(sys.argv[1:], "u:s:w")
 
     if not len(args):
         eprint("Usage: {} [options] search_dir".format(sys.argv[0]))
@@ -216,6 +277,11 @@ if __name__ == "__main__":
 
     if 's' in ops:
         sinks.append(SQLiteSink(ops['s']))
+
+    if 'w' in ops:
+        H_ALGS.append(ih.whash)
+        WHASH_ENABLED = True
+        eprint("WHash is ENABLED! This could take *quite* awhile...")
 
     # add the status sink only if another has been added, else use the default ProcImageSink
     sinks.append(StatusSink() if len(sinks) else ProcImageSink())
